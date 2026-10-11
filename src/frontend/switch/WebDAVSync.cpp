@@ -14,6 +14,7 @@
 #include <atomic>
 #include <dirent.h>
 #include <switch.h>
+#include <cctype>
 
 namespace WebDAVSync
 {
@@ -95,23 +96,24 @@ static std::string manifest_key(const char* local_path)
 // Build the full remote URL for a local save file path
 static std::string remote_url(const char* local_path)
 {
-    const char* slash = strrchr(local_path, '/');
-    const char* filename = slash ? slash + 1 : local_path;
-
     std::string url = Config::WebDAVURL;
     if (!url.empty() && url.back() != '/') url += '/';
-    std::string remote = Config::WebDAVRemotePath;
-    if (!remote.empty() && remote.front() == '/') remote = remote.substr(1);
-    if (!remote.empty() && remote.back() != '/') remote += '/';
-    url += remote;
-
-    std::string fname = filename;
-    if (fname.size() > 4 && fname.substr(fname.size() - 4) == ".sav")
-        fname = fname.substr(0, fname.size() - 4) + ".srm";
-
-    char* escaped = curl_easy_escape(nullptr, fname.c_str(), (int)fname.size());
-    if (escaped) { url += escaped; curl_free(escaped); }
-    else url += fname;
+    const std::string path = manifest_key(local_path);
+    // Configuration and manifest paths are literal filenames. Encode each
+    // segment for the HTTP request, preserving directory separators.
+    size_t start = 0;
+    while (start < path.size())
+    {
+        size_t end = path.find('/', start);
+        if (end == std::string::npos) end = path.size();
+        std::string segment = path.substr(start, end - start);
+        char* escaped = curl_easy_escape(nullptr, segment.c_str(), (int)segment.size());
+        if (!escaped) return {};
+        url += escaped;
+        curl_free(escaped);
+        if (end < path.size()) url += '/';
+        start = end + 1;
+    }
     return url;
 }
 
@@ -135,8 +137,19 @@ static time_t get_remote_mtime(const char* url)
 
     if (res != CURLE_OK || http_code == 404) return 0;
 
+    std::string normalizedHeaders = headers;
+
+    std::transform(
+        normalizedHeaders.begin(),
+        normalizedHeaders.end(),
+        normalizedHeaders.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        }
+    );
+
     const char* needle = "last-modified: ";
-    size_t pos = headers.find(needle);
+    size_t pos = normalizedHeaders.find(needle);
     // File exists on server but has no Last-Modified header — distinguish from "not found"
     if (pos == std::string::npos) { dbg("No Last-Modified header"); return (time_t)-1; }
 
@@ -505,6 +518,12 @@ SyncResult Sync(const char* local_path, std::string& out_message, bool upload_on
     }
 
     std::string url = remote_url(local_path);
+    if (url.empty())
+    {
+        snprintf(s_status_str, sizeof(s_status_str), "Failed to encode remote save URL");
+        out_message = s_status_str;
+        return Sync_Error;
+    }
     dbg("Remote URL: %s", url.c_str());
 
     struct stat st;
